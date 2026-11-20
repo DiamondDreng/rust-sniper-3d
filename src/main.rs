@@ -5,6 +5,7 @@ mod model;
 mod player;
 mod protocol;
 mod server;
+mod settings;
 mod world;
 
 use std::net::{SocketAddr, ToSocketAddrs};

@@ -14,7 +14,7 @@
 
 use bevy::prelude::*;
 
-use crate::combat::FIRE_COOLDOWN_TICKS;
+use crate::combat::{FIRE_COOLDOWN_TICKS, MAGAZINE_SIZE, RELOAD_TICKS};
 use crate::protocol::{InputFrame, PlayerState, TICK_DT};
 
 /// Eye height above the feet.
@@ -266,9 +266,22 @@ pub fn step_player(state: &mut PlayerState, frame: &InputFrame, solids: &[(Vec3,
     state.pitch = frame.pitch;
     state.last_seq = frame.seq;
 
-    let fired = alive && frame.fire && state.cooldown == 0;
+    if state.reload > 0 {
+        state.reload -= 1;
+        if state.reload == 0 {
+            state.ammo = MAGAZINE_SIZE;
+        }
+    } else if alive && frame.reload && state.ammo < MAGAZINE_SIZE {
+        state.reload = RELOAD_TICKS;
+    }
+
+    let fired = alive && frame.fire && state.cooldown == 0 && state.reload == 0 && state.ammo > 0;
     if fired {
         state.cooldown = FIRE_COOLDOWN_TICKS;
+        state.ammo -= 1;
+        if state.ammo == 0 {
+            state.reload = RELOAD_TICKS;
+        }
     }
     fired
 }

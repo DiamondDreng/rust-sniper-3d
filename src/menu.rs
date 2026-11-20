@@ -17,7 +17,8 @@ use bevy_replicon::prelude::*;
 use bevy_replicon_renet::{RenetClient, netcode::NetcodeClientTransport};
 
 use crate::client::begin_connect;
-use crate::protocol::DEFAULT_PORT;
+use crate::protocol::{DEFAULT_PORT, MAX_NAME_LEN};
+use crate::settings::Settings;
 
 const SERVERS_FILE: &str = "servers.txt";
 const MAX_INPUT_LEN: usize = 80;
@@ -75,6 +76,7 @@ struct SavedServer {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
+    Nick,
     Name,
     Address,
 }
@@ -247,6 +249,7 @@ fn try_connect(
 fn type_into_fields(
     mut keys: MessageReader<KeyboardInput>,
     mut menu: ResMut<MenuState>,
+    mut settings: ResMut<Settings>,
     link: Res<Link>,
     mut actions: MessageWriter<DoAction>,
 ) {
@@ -259,15 +262,24 @@ fn type_into_fields(
         match event.key_code {
             KeyCode::Backspace => {
                 match menu.focus {
-                    Field::Name => menu.name_input.pop(),
-                    Field::Address => menu.address_input.pop(),
+                    Field::Nick => {
+                        settings.name.pop();
+                        settings.save();
+                    }
+                    Field::Name => {
+                        menu.name_input.pop();
+                    }
+                    Field::Address => {
+                        menu.address_input.pop();
+                    }
                 };
                 menu.dirty = true;
             }
             KeyCode::Tab => {
                 menu.focus = match menu.focus {
+                    Field::Nick => Field::Name,
                     Field::Name => Field::Address,
-                    Field::Address => Field::Name,
+                    Field::Address => Field::Nick,
                 };
                 menu.dirty = true;
             }
@@ -282,11 +294,19 @@ fn type_into_fields(
             }
             _ => {
                 if let Some(text) = &event.text {
-                    let field = match menu.focus {
-                        Field::Name => &mut menu.name_input,
-                        Field::Address => &mut menu.address_input,
-                    };
                     for character in text.chars().filter(|c| !c.is_control()) {
+                        if menu.focus == Field::Nick {
+                            if settings.name.chars().count() < MAX_NAME_LEN {
+                                settings.name.push(character);
+                                settings.save();
+                                menu.dirty = true;
+                            }
+                            continue;
+                        }
+                        let field = match menu.focus {
+                            Field::Name => &mut menu.name_input,
+                            _ => &mut menu.address_input,
+                        };
                         if field.chars().count() < MAX_INPUT_LEN {
                             field.push(character);
                             menu.dirty = true;
@@ -519,6 +539,7 @@ fn close_menu(mut commands: Commands, menu_ui: Query<Entity, With<MenuUi>>) {
 fn rebuild_menu(
     mut commands: Commands,
     mut menu: ResMut<MenuState>,
+    settings: Res<Settings>,
     link: Res<Link>,
     existing: Query<Entity, With<MenuUi>>,
 ) {
@@ -581,6 +602,13 @@ fn rebuild_menu(
                             button("Connect", MenuAction::Connect, BUTTON_BLUE, 150.0),
                             button("Delete", MenuAction::Delete, BUTTON_RED, 150.0),
                         ],
+                    ),
+                    label("Your nickname", 22.0, GRAY),
+                    text_field(
+                        "Nickname (shown to other players)",
+                        settings.name.clone(),
+                        menu.focus == Field::Nick,
+                        Field::Nick,
                     ),
                     label("Add a server, or join an address directly", 22.0, GRAY),
                     text_field(

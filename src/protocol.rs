@@ -46,6 +46,44 @@ pub struct PlayerState {
     pub crouch_held: bool,
     /// A jump press stays "remembered" for a few ticks so you can press slightly before landing.
     pub jump_buffer: u8,
+    /// Rounds left in the magazine.
+    pub ammo: u8,
+    /// Ticks until the reload finishes (0 = not reloading).
+    pub reload: u16,
+}
+
+/// Display name, replicated to everyone (shown on name tags and the scoreboard).
+#[derive(Component, Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct PlayerName(pub String);
+
+impl Default for PlayerName {
+    fn default() -> Self {
+        Self("Player".into())
+    }
+}
+
+/// Kills and deaths in the current match, replicated to everyone for the scoreboard.
+#[derive(Component, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct PlayerStats {
+    pub kills: u16,
+    pub deaths: u16,
+}
+
+pub const MAX_NAME_LEN: usize = 16;
+
+/// Never trust a client-supplied name: strip control characters, trim, cap the length.
+pub fn sanitize_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_NAME_LEN)
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        PlayerName::default().0
+    } else {
+        cleaned.to_string()
+    }
 }
 
 /// Which connection owns this player (the netcode client id).
@@ -69,6 +107,8 @@ pub struct InputFrame {
     /// The trigger was pulled this tick. Fire is part of the input so the shot happens
     /// from exactly the position the client predicted at that tick.
     pub fire: bool,
+    /// Start a reload (it also starts by itself when the magazine runs empty).
+    pub reload: bool,
     /// The server tick the shooter was looking at (for lag compensation).
     pub view_tick: u32,
 }
@@ -101,10 +141,30 @@ pub struct PlayerInput {
     pub frames: Vec<InputFrame>,
 }
 
-/// Server -> owner only: your current health.
+/// Client -> server: the nickname to show.
+#[derive(Message, Serialize, Deserialize, Clone, Debug)]
+pub struct SetName(pub String);
+
+/// Server -> owner only: your current health, and where the shot that hurt you came from.
 #[derive(Message, Serialize, Deserialize, Clone, Copy, Debug)]
 pub struct HealthUpdate {
     pub health: f32,
+    pub damage_source: Option<Vec3>,
+}
+
+/// Server -> everyone: someone was killed (for the kill feed).
+#[derive(Message, Serialize, Deserialize, Clone, Debug)]
+pub struct KillFeed {
+    pub killer: String,
+    pub victim: String,
+    pub headshot: bool,
+}
+
+/// Server -> everyone: the match ended / a new one began.
+#[derive(Message, Serialize, Deserialize, Clone, Debug)]
+pub enum MatchEvent {
+    Won { winner: String },
+    Started,
 }
 
 /// Server -> shooter only: your shot hit someone.
@@ -120,6 +180,8 @@ pub struct ShotFx {
     pub shooter: u64,
     pub origin: Vec3,
     pub end: Vec3,
+    /// The shot struck a player (as opposed to a wall or nothing), for impact effects.
+    pub hit_player: bool,
 }
 
 pub struct ProtocolPlugin;
@@ -129,8 +191,13 @@ impl Plugin for ProtocolPlugin {
         app.insert_resource(Time::<Fixed>::from_hz(TICK_RATE))
             .replicate::<PlayerState>()
             .replicate::<PlayerOwner>()
+            .replicate::<PlayerName>()
+            .replicate::<PlayerStats>()
             // Unordered: a newer input makes an older one irrelevant.
             .add_client_message::<PlayerInput>(Channel::Unordered)
+            .add_client_message::<SetName>(Channel::Ordered)
+            .add_server_message::<KillFeed>(Channel::Ordered)
+            .add_server_message::<MatchEvent>(Channel::Ordered)
             .add_server_message::<HealthUpdate>(Channel::Ordered)
             .add_server_message::<HitFeedback>(Channel::Ordered)
             .add_server_message::<ShotFx>(Channel::Unordered);

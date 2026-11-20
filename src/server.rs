@@ -1,5 +1,6 @@
 //! Headless authoritative server: owns all player state, simulates movement,
-//! resolves shots (with lag compensation), applies damage and respawns.
+//! resolves shots (with lag compensation), applies damage, tracks the score and runs the
+//! match (respawns, winner, next round).
 //!
 //! Movement is *input-driven*: every input frame a client sends advances that player
 //! by exactly one tick, in order. The state carries `last_seq` so the client knows
@@ -9,6 +10,7 @@ use std::collections::VecDeque;
 use std::net::{Ipv4Addr, UdpSocket};
 use std::time::SystemTime;
 
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy_replicon::{
     prelude::*,
@@ -22,12 +24,13 @@ use bevy_replicon_renet::{
 };
 
 use crate::combat::{
-    BODY_DAMAGE, HEAD_DAMAGE, MAX_HEALTH, MAX_REWIND_TICKS, RESPAWN_TICKS, Target, aim_direction,
-    trace,
+    BODY_DAMAGE, HEAD_DAMAGE, INTERMISSION_TICKS, MAGAZINE_SIZE, MAX_HEALTH, MAX_REWIND_TICKS,
+    RESPAWN_TICKS, SCORE_LIMIT, SPAWN_PROTECTION_TICKS, Target, aim_direction, trace,
 };
 use crate::player::{eye_height, step_player};
 use crate::protocol::{
-    HealthUpdate, HitFeedback, PROTOCOL_ID, PlayerInput, PlayerOwner, PlayerState, ShotFx,
+    HealthUpdate, HitFeedback, KillFeed, MatchEvent, PROTOCOL_ID, PlayerInput, PlayerName,
+    PlayerOwner, PlayerState, PlayerStats, SetName, ShotFx, sanitize_name,
 };
 use crate::world::{LevelGeometry, spawn_points};
 
@@ -52,6 +55,10 @@ struct Health(f32);
 #[derive(Component)]
 struct RespawnTimer(u32);
 
+/// Ticks of damage immunity left after (re)spawning.
+#[derive(Component)]
+struct Protection(u32);
+
 /// Where this player's feet were (and whether they were crouched) at the end of each recent
 /// tick, newest last. Used to rewind players to what a lagging shooter was seeing.
 #[derive(Component, Default)]
@@ -60,8 +67,47 @@ struct PositionHistory(VecDeque<(u32, Vec3, bool)>);
 #[derive(Resource)]
 struct ServerPort(u16);
 
+/// Rotates which spawn point wins a tie, so spawns vary when nobody is around.
 #[derive(Resource, Default)]
 struct NextSpawn(usize);
+
+/// Whether a match is running, or the winner screen is up (shots are ignored then).
+#[derive(Resource, Default, PartialEq, Eq, Debug)]
+enum MatchPhase {
+    #[default]
+    Playing,
+    Intermission(u32),
+}
+
+/// Everything the server sends out, bundled so systems stay readable.
+#[derive(SystemParam)]
+struct Outbox<'w> {
+    health: MessageWriter<'w, ToClients<HealthUpdate>>,
+    hits: MessageWriter<'w, ToClients<HitFeedback>>,
+    shots: MessageWriter<'w, ToClients<ShotFx>>,
+    kills: MessageWriter<'w, ToClients<KillFeed>>,
+    matches: MessageWriter<'w, ToClients<MatchEvent>>,
+}
+
+impl Outbox<'_> {
+    fn send_health(
+        &mut self,
+        network_ids: &NetworkIdMap,
+        owner: u64,
+        health: f32,
+        damage_source: Option<Vec3>,
+    ) {
+        if let Some(&client) = network_ids.get(&NetworkId::new(owner)) {
+            self.health.write(ToClients {
+                targets: SendTargets::Single(ClientId::Client(client)),
+                message: HealthUpdate {
+                    health,
+                    damage_source,
+                },
+            });
+        }
+    }
+}
 
 pub struct GameServerPlugin {
     pub port: u16,
@@ -71,18 +117,26 @@ impl Plugin for GameServerPlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(ServerPort(self.port))
             .init_resource::<NextSpawn>()
+            .init_resource::<MatchPhase>()
             .add_systems(Startup, start_server)
             .add_observer(spawn_player)
             .add_observer(despawn_player)
             .add_systems(
                 PreUpdate,
-                receive_inputs
+                (receive_names, receive_inputs)
+                    .chain()
                     .after(ServerSystems::Receive)
                     .run_if(in_state(ServerState::Running)),
             )
             .add_systems(
                 FixedUpdate,
-                (refill_budgets, record_history, tick_respawns)
+                (
+                    refill_budgets,
+                    record_history,
+                    tick_protection,
+                    tick_respawns,
+                    tick_match,
+                )
                     .chain()
                     .run_if(in_state(ServerState::Running)),
             );
@@ -120,12 +174,53 @@ fn start_server(
     Ok(())
 }
 
-/// Picks spawn points in rotation so players don't start on top of each other.
-fn next_spawn(counter: &mut NextSpawn) -> Vec3 {
-    let points = spawn_points();
-    let point = points[counter.0 % points.len()];
+/// Picks the spawn point farthest from every enemy (so you don't spawn in someone's sights).
+/// With nobody around every point ties, and `rotation` decides, so spawns still vary.
+fn pick_spawn(candidates: &[Vec3], enemies: &[Vec3], rotation: usize) -> Vec3 {
+    let mut best = candidates[rotation % candidates.len()];
+    let mut best_distance = f32::NEG_INFINITY;
+    for offset in 0..candidates.len() {
+        let point = candidates[(rotation + offset) % candidates.len()];
+        let nearest = enemies
+            .iter()
+            .map(|enemy| (*enemy - point).with_y(0.0).length())
+            .fold(f32::INFINITY, f32::min);
+        if nearest > best_distance {
+            best_distance = nearest;
+            best = point;
+        }
+    }
+    best
+}
+
+fn choose_spawn<'a>(
+    counter: &mut NextSpawn,
+    enemies: impl IntoIterator<Item = &'a PlayerState>,
+) -> Vec3 {
+    let positions: Vec<Vec3> = enemies
+        .into_iter()
+        .filter(|state| state.alive)
+        .map(|state| state.position)
+        .collect();
     counter.0 += 1;
-    point
+    pick_spawn(&spawn_points(), &positions, counter.0)
+}
+
+/// Resets a player for a new life, keeping the bookkeeping the client's prediction relies on.
+fn respawn(state: &mut PlayerState, health: &mut Health, protection: &mut Protection, at: Vec3) {
+    health.0 = MAX_HEALTH;
+    protection.0 = SPAWN_PROTECTION_TICKS;
+    *state = PlayerState {
+        position: at,
+        alive: true,
+        ammo: MAGAZINE_SIZE,
+        last_seq: state.last_seq,
+        yaw: state.yaw,
+        pitch: state.pitch,
+        jump_held: state.jump_held,
+        crouch_held: state.crouch_held,
+        ..default()
+    };
 }
 
 /// A client finished connecting: give it a player.
@@ -133,8 +228,10 @@ fn spawn_player(
     add: On<Add, AuthorizedClient>,
     mut commands: Commands,
     ids: Query<&NetworkId>,
+    network_ids: Res<NetworkIdMap>,
     mut spawns: ResMut<NextSpawn>,
-    mut health_out: MessageWriter<ToClients<HealthUpdate>>,
+    others: Query<&PlayerState>,
+    mut out: Outbox,
 ) {
     let Ok(id) = ids.get(add.entity) else {
         return;
@@ -144,20 +241,21 @@ fn spawn_player(
     commands.spawn((
         Replicated,
         PlayerOwner(id.get()),
+        PlayerName::default(),
+        PlayerStats::default(),
         PlayerState {
-            position: next_spawn(&mut spawns),
+            position: choose_spawn(&mut spawns, &others),
             alive: true,
+            ammo: MAGAZINE_SIZE,
             ..default()
         },
         Health(MAX_HEALTH),
+        Protection(SPAWN_PROTECTION_TICKS),
         InputBudget(MAX_INPUT_BUDGET),
         PositionHistory::default(),
     ));
 
-    health_out.write(ToClients {
-        targets: SendTargets::Single(ClientId::Client(add.entity)),
-        message: HealthUpdate { health: MAX_HEALTH },
-    });
+    out.send_health(&network_ids, id.get(), MAX_HEALTH, None);
 }
 
 /// A client disconnected: remove its player (this also despawns it on every client).
@@ -179,9 +277,37 @@ fn despawn_player(
     }
 }
 
+fn receive_names(
+    mut commands: Commands,
+    mut names: MessageReader<FromClient<SetName>>,
+    ids: Query<&NetworkId>,
+    players: Query<(Entity, &PlayerOwner, &PlayerName)>,
+) {
+    for message in names.read() {
+        let ClientId::Client(client) = message.client_id else {
+            continue;
+        };
+        let Ok(id) = ids.get(client) else {
+            continue;
+        };
+        let name = sanitize_name(&message.message.0);
+        for (entity, owner, current) in &players {
+            if owner.0 == id.get() && current.0 != name {
+                commands.entity(entity).insert(PlayerName(name.clone()));
+            }
+        }
+    }
+}
+
 fn refill_budgets(mut budgets: Query<&mut InputBudget>) {
     for mut budget in &mut budgets {
         budget.0 = (budget.0 + 1.0).min(MAX_INPUT_BUDGET);
+    }
+}
+
+fn tick_protection(mut players: Query<&mut Protection>) {
+    for mut protection in &mut players {
+        protection.0 = protection.0.saturating_sub(1);
     }
 }
 
@@ -197,38 +323,73 @@ fn record_history(tick: Res<ServerTick>, mut players: Query<(&PlayerState, &mut 
     }
 }
 
-/// Dead players respawn after a delay: full health, new spawn point.
+/// Dead players respawn after a delay: full health, a spawn point away from the others.
 fn tick_respawns(
     mut commands: Commands,
     mut spawns: ResMut<NextSpawn>,
-    mut dead: Query<(Entity, &PlayerOwner, &mut RespawnTimer, &mut PlayerState, &mut Health)>,
+    mut dead: Query<(
+        Entity,
+        &PlayerOwner,
+        &mut RespawnTimer,
+        &mut PlayerState,
+        &mut Health,
+        &mut Protection,
+    )>,
+    living: Query<&PlayerState, Without<RespawnTimer>>,
     network_ids: Res<NetworkIdMap>,
-    mut health_out: MessageWriter<ToClients<HealthUpdate>>,
+    mut out: Outbox,
 ) {
-    for (entity, owner, mut timer, mut state, mut health) in &mut dead {
+    for (entity, owner, mut timer, mut state, mut health, mut protection) in &mut dead {
         timer.0 = timer.0.saturating_sub(1);
         if timer.0 > 0 {
             continue;
         }
 
-        health.0 = MAX_HEALTH;
-        state.position = next_spawn(&mut spawns);
-        state.velocity = Vec3::ZERO;
-        state.alive = true;
-        state.cooldown = 0;
-        state.crouched = false;
-        state.slide_ticks = 0;
-        state.slide_cooldown = 0;
-        state.jump_buffer = 0;
+        let at = choose_spawn(&mut spawns, &living);
+        respawn(&mut state, &mut health, &mut protection, at);
         commands.entity(entity).remove::<RespawnTimer>();
-
-        if let Some(&client) = network_ids.get(&NetworkId::new(owner.0)) {
-            health_out.write(ToClients {
-                targets: SendTargets::Single(ClientId::Client(client)),
-                message: HealthUpdate { health: MAX_HEALTH },
-            });
-        }
+        out.send_health(&network_ids, owner.0, MAX_HEALTH, None);
     }
+}
+
+/// Counts down the winner screen, then starts a fresh match: scores reset, everyone respawns.
+fn tick_match(
+    mut commands: Commands,
+    mut phase: ResMut<MatchPhase>,
+    mut spawns: ResMut<NextSpawn>,
+    mut players: Query<(
+        Entity,
+        &PlayerOwner,
+        &mut PlayerState,
+        &mut Health,
+        &mut Protection,
+        &mut PlayerStats,
+    )>,
+    network_ids: Res<NetworkIdMap>,
+    mut out: Outbox,
+) {
+    let MatchPhase::Intermission(ticks) = *phase else {
+        return;
+    };
+    if ticks > 0 {
+        *phase = MatchPhase::Intermission(ticks - 1);
+        return;
+    }
+
+    let mut taken: Vec<PlayerState> = Vec::new();
+    for (entity, owner, mut state, mut health, mut protection, mut stats) in &mut players {
+        let at = choose_spawn(&mut spawns, &taken);
+        respawn(&mut state, &mut health, &mut protection, at);
+        *stats = PlayerStats::default();
+        taken.push(*state);
+        commands.entity(entity).remove::<RespawnTimer>();
+        out.send_health(&network_ids, owner.0, MAX_HEALTH, None);
+    }
+    out.matches.write(ToClients {
+        targets: SendTargets::All,
+        message: MatchEvent::Started,
+    });
+    *phase = MatchPhase::Playing;
 }
 
 /// Where `history` says a player's feet were at `tick` (nearest recorded tick), and whether
@@ -253,6 +414,7 @@ fn receive_inputs(
     tick: Res<ServerTick>,
     network_ids: Res<NetworkIdMap>,
     ids: Query<&NetworkId>,
+    mut phase: ResMut<MatchPhase>,
     mut players: Query<(
         Entity,
         &PlayerOwner,
@@ -261,9 +423,8 @@ fn receive_inputs(
         &mut Health,
         &PositionHistory,
     )>,
-    mut health_out: MessageWriter<ToClients<HealthUpdate>>,
-    mut hit_out: MessageWriter<ToClients<HitFeedback>>,
-    mut fx_out: MessageWriter<ToClients<ShotFx>>,
+    mut scores: Query<(&PlayerName, &mut PlayerStats, &Protection)>,
+    mut out: Outbox,
 ) {
     let now = tick.get();
 
@@ -306,7 +467,7 @@ fn receive_inputs(
                 (fired, state.position, state.yaw, state.pitch)
             };
 
-            if !fired {
+            if !fired || *phase != MatchPhase::Playing {
                 continue;
             }
 
@@ -333,18 +494,24 @@ fn receive_inputs(
             let result = trace(origin, dir, &level.0, &targets);
 
             // Tracer for everyone *except the shooter*, who already drew their own instantly.
-            fx_out.write(ToClients {
+            out.shots.write(ToClients {
                 targets: SendTargets::AllExcept(ClientId::Client(client)),
                 message: ShotFx {
                     shooter: id.get(),
                     origin,
                     end: origin + dir * result.end_distance,
+                    hit_player: result.hit.is_some(),
                 },
             });
 
             let Some(hit) = result.hit else {
                 continue;
             };
+
+            // Spawn protection: the shot is wasted and the shooter gets no hit feedback.
+            if scores.get(hit.target).is_ok_and(|(_, _, protection)| protection.0 > 0) {
+                continue;
+            }
 
             let damage = if hit.headshot { HEAD_DAMAGE } else { BODY_DAMAGE };
             let mut killed = false;
@@ -358,15 +525,14 @@ fn receive_inputs(
                     info!("player {} was killed by {}", owner.0, id.get());
                 }
 
-                if let Some(&victim_client) = network_ids.get(&NetworkId::new(owner.0)) {
-                    health_out.write(ToClients {
-                        targets: SendTargets::Single(ClientId::Client(victim_client)),
-                        message: HealthUpdate { health: health.0 },
-                    });
-                }
+                out.send_health(&network_ids, owner.0, health.0, Some(origin));
             }
 
-            hit_out.write(ToClients {
+            if killed {
+                record_kill(&mut scores, shooter, hit.target, hit.headshot, &mut phase, &mut out);
+            }
+
+            out.hits.write(ToClients {
                 targets: SendTargets::Single(ClientId::Client(client)),
                 message: HitFeedback {
                     headshot: hit.headshot,
@@ -374,5 +540,73 @@ fn receive_inputs(
                 },
             });
         }
+    }
+}
+
+/// Updates the score for a kill, announces it, and ends the match at the score limit.
+fn record_kill(
+    scores: &mut Query<(&PlayerName, &mut PlayerStats, &Protection)>,
+    killer: Entity,
+    victim: Entity,
+    headshot: bool,
+    phase: &mut MatchPhase,
+    out: &mut Outbox,
+) {
+    let mut victim_name = String::new();
+    if let Ok((name, mut stats, _)) = scores.get_mut(victim) {
+        stats.deaths += 1;
+        victim_name = name.0.clone();
+    }
+    let Ok((name, mut stats, _)) = scores.get_mut(killer) else {
+        return;
+    };
+    stats.kills += 1;
+    let killer_name = name.0.clone();
+
+    out.kills.write(ToClients {
+        targets: SendTargets::All,
+        message: KillFeed {
+            killer: killer_name.clone(),
+            victim: victim_name,
+            headshot,
+        },
+    });
+
+    if stats.kills >= SCORE_LIMIT && *phase == MatchPhase::Playing {
+        *phase = MatchPhase::Intermission(INTERMISSION_TICKS);
+        out.matches.write(ToClients {
+            targets: SendTargets::All,
+            message: MatchEvent::Won {
+                winner: killer_name,
+            },
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn points() -> Vec<Vec3> {
+        vec![
+            Vec3::new(-20.0, 1.7, 0.0),
+            Vec3::new(0.0, 1.7, 0.0),
+            Vec3::new(20.0, 1.7, 0.0),
+        ]
+    }
+
+    #[test]
+    fn spawn_is_as_far_from_enemies_as_possible() {
+        let enemies = [Vec3::new(18.0, 1.7, 0.0)];
+        assert_eq!(pick_spawn(&points(), &enemies, 0), Vec3::new(-20.0, 1.7, 0.0));
+        let enemies = [Vec3::new(-18.0, 1.7, 0.0), Vec3::new(18.0, 1.7, 0.0)];
+        assert_eq!(pick_spawn(&points(), &enemies, 0), Vec3::new(0.0, 1.7, 0.0));
+    }
+
+    #[test]
+    fn spawn_rotates_when_nobody_is_around() {
+        let a = pick_spawn(&points(), &[], 0);
+        let b = pick_spawn(&points(), &[], 1);
+        assert_ne!(a, b);
     }
 }

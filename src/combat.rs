@@ -12,6 +12,15 @@ pub const RANGE: f32 = 500.0;
 /// Bolt action: 1.5 s at 64 ticks per second.
 pub const FIRE_COOLDOWN_TICKS: u16 = 96;
 pub const RESPAWN_TICKS: u32 = 64 * 3;
+/// Rounds in a full magazine. The rifle reloads automatically when empty.
+pub const MAGAZINE_SIZE: u8 = 5;
+pub const RELOAD_TICKS: u16 = 64 * 5 / 2; // 2.5 s
+/// Freshly (re)spawned players can't be damaged for this long.
+pub const SPAWN_PROTECTION_TICKS: u32 = 64 * 2;
+/// First player to reach this many kills wins the match.
+pub const SCORE_LIMIT: u16 = 10;
+/// How long the winner screen stays up before the next match starts.
+pub const INTERMISSION_TICKS: u32 = 64 * 10;
 /// The server never rewinds further than this (500 ms), so high ping can't be abused.
 pub const MAX_REWIND_TICKS: u32 = 32;
 
